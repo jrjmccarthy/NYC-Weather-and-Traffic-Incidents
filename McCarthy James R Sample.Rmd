@@ -1,0 +1,991 @@
+---
+title: "R Programming Sample"
+author: "James McCarthy"
+output: 
+  rmarkdown::html_document:
+      theme: readable
+      toc: True
+      toc_float: True
+      toc_collapsed: True
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results='hide', message=F, warning = F)
+```
+
+# Introduction
+
+Welcome to my R programming sample!
+
+In this program, I attempt to confirm that on average, the number of vehicle collisions and number of injuries and fatalities due to collisions are higher on days of inclement weather in Manhattan from 2013 to 2021 than on those of clement weather. 
+
+Using precipitation data from NOAA's central park weather station acquired through a request on their website as well as vehicular collisions data from the NYPD acquired through NYC Open Data, I will quality check, modify, aggregate, merge, visualize, and model this data to confirm my hypothesis that precipitation is associated with traffic incidents in the borough of Manhattan.
+
+# Libraries
+
+```{r, message=F, warning = F}
+# import libraries
+library("tidyverse") 
+library("magrittr") #pipes
+library("stats") #glm regressions
+library("psych") # correlations
+library("naniar") # easy missingness checks
+library("janitor") # easy dupe counts
+library("gtools") # p stars
+library("knitr") # knitting options
+library("kableExtra") # more knitting options
+library("statmod") #tweedie index maximum likelihood
+library("tweedie") #tweedie regressions
+library("glmnet") # lasso, ridge, elastic net regressions
+library("randomForest") # random forest regression
+library("neuralnet") # neural net regression
+
+#scroll_box global height/width parameters set for kable objects
+formals(scroll_box)$height <- "500px"
+formals(scroll_box)$width <- "100%"
+```
+
+# General functions
+
+```{r}
+# Function to output nicely formatted tables in this knitted rmd
+#
+# Parameters:
+# .df: dataset
+# .caption: optional argument to caption table, defaults to empty string
+# .fwidth: optional argument to specify table to use full width, defaults to FALSE
+# .column_names: optional argument to assign names to table, defaults to NA
+#
+# Returns:
+# kable object of original dataset with booktabs theme and potential caption
+
+kable_table <- function(.df, .caption = '', .fwidth = F, .column_names = NA){
+  kable_item <- .df %>%
+    kableExtra::kbl(caption = .caption, booktabs = T, col.names = .column_names) %>% #kable object, booktabs theme, caption specify
+    kableExtra::kable_classic(full_width = .fwidth) %>% #Ekable_classic theme, not full width
+    kableExtra::kable_styling(bootstrap_options = c('striped', 'hover'), latex_options = "HOLD_position") #for rowwise readability, table placement in knitted doc
+  
+  return(kable_item)
+}
+```
+
+
+```{r}
+# Function to make ggplot output generally prettier and standardized theme
+#
+# Parameters:
+# None
+#
+# Returns:
+# NULL
+ggtheme <- function(){
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), #remove major grid lines
+        panel.grid.minor = element_blank(), #remove minor grid lines
+        panel.border = element_blank(), # remove border
+        axis.line = element_line(color = "black"), #axis line black 
+        axis.title.y = element_text(angle = 0, vjust = 0.5), #y axis labels horizontal, centered
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 11)) #bold title, centered
+}
+```
+
+
+# Data Read In
+
+```{r data root}
+#root data directory path
+data_root <- "C:/Users/jmcca/OneDrive/Documents/Data"
+
+# Local climatological data from NOAA's Central Park Station 
+# Hourly Level Data
+# Date Range = Jan 1, 2013 - Dec 31, 2021
+weather <- read_csv(file.path(data_root, "NOAA_LCD_Central_Park_2013_2021.csv")) %T>%
+  glimpse()
+
+#NYPD Vehicle Collision Data
+# Collision Level Dataset - all police reported collisions/num_crashes across NYC
+collisions <- read_csv(file.path(data_root, "NYPD_Motor_Vehicle_Collisions.csv")) %T>%
+  glimpse()
+```
+
+# Quality Check
+
+## Weather Data
+
+This dataset from NOAA contains information about observed weather phenomena in Central Park, Manhattan from 2013 to 2021. It is hourly level, with dedicated rows for daily and monthly summaries. I will primarily be interested in the precipitation items, although this dataset contains a plethora of information on other values such as temperature, pressure, humidity, visibility, etc. 
+
+```{r}
+#duplicate col names existed in weather when read in
+#R appended column position to name 
+
+#wondering if these columns are simply dupes
+weather %>%
+  select(matches('SOURCE')) %>%
+  distinct()
+
+weather %>%
+  select(matches('REPORT_TYPE')) %>%
+  distinct()
+#seems like both sets of columns are indeed duplicates
+```
+
+
+```{r}
+#drop the latter duplicate columns and rename former
+weather_names_mod <- weather %>%
+  select(-c("REPORT_TYPE...96", "SOURCE...97")) %>%
+  rename(REPORT_TYPE = REPORT_TYPE...3,
+         SOURCE = SOURCE...4) 
+```
+
+### Missingness
+
+```{r, results='asis'}
+#checking missingness
+weather_names_mod %>%
+  naniar::miss_var_summary() %>%
+  kable_table("Missingess summary, weather")%>%
+  scroll_box()
+```
+
+
+There is a good amount of missingness for many variables, but the Date column is never missing which is helpful for merging later on. Since this is an hourly level dataset, the missingness by monthly and daily variables doesn't concern me too much.
+
+### Dates
+
+```{r, results='asis'}
+#confirming date range is as expected
+weather_names_mod %>%
+  summarise(earliest = min(as.Date(DATE), na.rm = T),
+            latest = max(as.Date(DATE), na.rm = T),
+            .groups = "drop") %>%
+  kable_table("Weather, date range")
+```
+
+### Duplicates
+
+```{r}
+#check for duplicates overall
+weather_names_mod %>%
+  janitor::get_dupes()
+# no dupes when considering all columns
+
+#check for dupes by date
+weather_names_mod %>%
+  janitor::get_dupes(DATE)
+#It appears there are duplicates by days by REPORT_TYPE variable
+#I can't find any info about this variable in documentation 
+
+#check how many REPORT_TYPE values exists, count
+weather_names_mod %>%
+  group_by(REPORT_TYPE) %>%
+  summarise(n=n(), .groups = "drop") 
+#SOM appears 108 times- number of months in 9 years of data
+#SOD appears 3287 times
+
+#get number of days between min and max dates
+difftime("2021-12-31", "2013-01-01", units = "days")
+#when inclusive, this matches number of SOD appearances
+```
+
+
+```{r}
+# What I glean is as follows
+# REPORT_TYPE: SOD (Summary of Day) because daily variables are non null
+# REPORT_TYPE: SOM (Summary of Month) because monthly variables are non null
+# Other REPORT_TYPE are hourly reports
+
+# REPORT_TYPE values FM-15 and FM-16 (hourly reports) seem to have dupes on occasion by time
+# however i'm not planning to use hourly data here, just daily and monthly summaries
+
+#check that no dupes exist by DATE and REPORT_TYPE
+weather_names_mod %>%
+  janitor::get_dupes(DATE, REPORT_TYPE)
+#none - looks good to me
+```
+
+### Weather Codes
+
+In this section, I will check if the observed weather types (DailyWeather column contains codes for different kinds of weather) generally matches if precipitation occurred in Manhattan. This is a good internal consistency check on the weather data to make sure precipitation is believable. 
+
+```{r}
+#check distinct values in DailyWeathers
+weather_names_mod %>%
+  select(DailyWeather) %>%
+  distinct() 
+#many combinations of observed weather types
+```
+
+```{r}
+#vector of weather codes in DailyWeather that could cause precipitation
+precip_codes <- c('BLSN', 'DZ', 'FZDZ', 'RA', 'FZRA', 'SN', 'UP')
+
+weather_names_mod_check <- weather_names_mod %>%
+  #filter for daily weather
+  filter(REPORT_TYPE == 'SOD') %>%
+  #dummy indicating if any of the above weather codes were observed for each day
+  mutate(precip_codes = case_when(grepl(paste(precip_codes, collapse = "|"), DailyWeather) ~ 1,
+                                       T ~ 0),
+         #dummy for Daily Precipitation above 0
+         measurable_precip = case_when(DailyPrecipitation > 0 ~ 1,
+                                       DailyPrecipitation == 0 ~ 0,
+                                     T ~ NA_real_))
+```
+
+
+```{r}
+#check this was made right, distinct values of DailyWeather and inclement_weather
+weather_names_mod_check %>%
+  select(DailyWeather, precip_codes) %>%
+  distinct()
+#lgtm
+```
+
+
+
+```{r, results='asis'}
+#check if observed weather dummy matches any measurable precipitation dummy
+weather_names_mod_check %>%
+  group_by(precip_codes, measurable_precip) %>%
+  summarise(n=n(), .groups = "drop") %>%
+  mutate(total = sum(n),
+         percent_total = 100 * round(n/total, 4)) %>%
+  select(-total) %>%
+  kable_table("Check of precip_codes versus measurable_precip")
+```
+
+About 90% of days with observed weather codes that could cause precipitation are also on days with non-zero precipitation. This data seems fairly consistent, especially as excluding missing precipitation days causes true mismatches to be <2%.
+
+## Collisions Data
+
+This dataset from NYC Open Data contains information on NYPD vehicular incident reports in New York City from roughly 2012 to 2023. It is report level, meaning each row represents a collision. While there are some interesting open ended columns such as contributing factors, I will be primarily interested in the number of injuries and fatalities reported as well as simply the number of rows (collisions) reported on each day.
+
+### Missingness
+
+```{r, results='asis'}
+collisions %>%
+  naniar::miss_var_summary() %>%
+  kable_table("Missingess summary collisions") %>%
+  scroll_box()
+#fair amount of collisions missing Borough
+#no dates missing though which is helpful
+#also number injured is rarely missing - primarily interested in these items
+```
+
+### Dates
+
+```{r, results='asis'}
+#first need to convert crash date from character to date type
+collisions_date_mod <- collisions %>%
+  #while im at it, create crash indicator since each row represents a collision
+  mutate(crash_date = as.Date(`CRASH DATE`, format = "%m/%d/%Y"),
+         num_crashes = 1) %>%
+  #relocate date column first
+  relocate(crash_date) 
+
+#now check date range
+collisions_date_mod %>%
+  summarise(earliest = min(crash_date),
+            latest = max(crash_date),
+            .groups = "drop") %>%
+  kable_table("Collisions, date range")
+
+```
+
+### Duplicates
+
+```{r}
+#check duplicates of collision id in collisions
+collisions_date_mod %>%
+  group_by(COLLISION_ID) %>%
+  summarise(n_dupes = n(), .groups = "drop") %>%
+  filter(n_dupes > 1)
+#0 rows, all collisions entries appear to be unique
+```
+
+
+
+# Analysis Dataset Creation
+
+The quality checks look good to me. Both weather and collisions datasets have been slightly modified in the previous section, but now I will modify them for the analysis dataset creation.
+
+My goal is to use a daily level dataset for analysis. This will require extracting the daily precipitation summaries from the weather data and aggregating the incident level collisions data to a daily value with a sum.
+
+### Modifying Weather
+
+```{r}
+#weather: instead of aggregating hourly data, will simply filter for summary of day reports
+daily_weather <- weather_names_mod %>%
+  filter(REPORT_TYPE == 'SOD') %>%
+  #im not interested in datetime, just date - omit time
+  mutate(date = as.Date(DATE)) %>%
+  #select relevant columns to keep
+  select(date, contains('Daily')) %>%
+  #263 obs missing precipitation, 128 snowfall, 38 snowdepth - seems right to impute these with 0
+  mutate(DailyPrecipitation = case_when(is.na(DailyPrecipitation) ~ 0,
+                                        T ~ DailyPrecipitation),
+         DailySnowfall = case_when(is.na(DailySnowfall) ~ 0,
+                                   T ~ DailySnowfall),
+         DailySnowDepth = case_when(is.na(DailySnowDepth) ~ 0,
+                                   T ~ DailySnowDepth)) %T>%
+  print()
+
+#double check for na
+daily_weather %>%
+  miss_var_summary()
+#everything im interested in is not na/has been imputed
+  
+```
+
+```{r}
+#the DailyWeather item contains codes for different type of observed weather that day
+daily_weather %>%
+  select(DailyWeather) %>%
+  distinct()
+
+#could make a precipitation present dummy based on whether some select codes are present on a daily basis
+```
+
+### Modifying Collisions
+
+```{r}
+#now back to collisions data
+#keep just collisions that occurred in Manhattan
+#filter dates to match weather data - only keep collisions within 1/1/13 - 12/13/21
+daily_collisions <- collisions_date_mod %>%
+  filter(BOROUGH == 'MANHATTAN' & (crash_date >= as.Date("2013-01-01") & crash_date <= as.Date("2021-12-31"))) %>%
+  #aggregate by date
+  group_by(crash_date) %>%
+  #sum num_crashes and number injured/killed to daily basis
+  summarise(across(matches("num_crashes|NUMBER"), ~sum(., na.rm = T)),
+            .groups = "drop") %T>%
+  print()
+#same number of rows as daily weather, so there must be at least 1 crash per day in manhattan - why i take the subway
+```
+
+
+```{r}
+#replace white spaces with '_' in column names for easier reference
+colnames(daily_collisions) <- gsub("\\s", "_", colnames(daily_collisions))
+
+#double check that worked
+daily_collisions %>%
+  names()
+#looks good
+
+#double check missingness
+daily_collisions %>%
+  naniar::miss_var_summary()
+#looks good to me, the few missing injured/killed obs previously must have been in other boroughs
+```
+
+
+```{r}
+#analysis dataset creation
+#merging daily weather and collisions data by date
+weather_collisions <- full_join(daily_weather, 
+          daily_collisions,
+          by = c('date' = 'crash_date')) %>%
+  #might use logged number of crashes in analysis
+  mutate(log_num_crashes = log(num_crashes)) %>%
+  print()
+```
+
+# Pre-Analysis Exploration
+
+In order to better determine the kind of algorithm to use for analysis, I'd like to better understand the data. In this section I will output descriptive statistics, histograms, and correlations of both precipitation and collisions data to get a sense of their range, distribution, and variance. This section could determine if I decide to use a linear or non linear model for evaluation.
+
+```{r}
+#vector of analysis variable names
+items_of_interest <- weather_collisions %>%
+  select(DailyPrecipitation, DailySnowfall, DailySnowDepth, num_crashes, contains("NUMBER")) %>%
+  names()
+```
+
+## Descriptive Stats
+
+```{r}
+# Function to calculate descriptive statistics
+#
+# Parameters:
+# .items: vector of string names of data columns to summarize
+# .df: dataset
+#
+# Returns:
+# Tibble containing n, n missing, min, Q1, median, Q3, max, mean, and sd for every column specified
+
+desc_stats_tabled <- function(.items, .df) {
+  #map over each element of .items
+  map_dfr(.items, function(.x) {
+    stats_output <- .df %>%
+      #stats include n, n missing, range, mean, standard dev
+      summarise(n=n(),
+                n_miss = sum(is.na(!!sym(.x))),
+                min = min(!!sym(.x), na.rm = T),
+                Q1 = quantile(!!sym(.x), probs = 0.25, na.rm = T),
+                median = quantile(!!sym(.x), probs = 0.5, na.rm = T),
+                Q3 = quantile(!!sym(.x), probs = 0.75, na.rm = T),
+                max = max(!!sym(.x), na.rm = T),
+                mean = round(mean(!!sym(.x), na.rm = T), 2), 
+                sd = round(sd(!!sym(.x), na.rm = T), 1),
+                .groups = "drop") %>%
+      #include .item name in output table
+      mutate(variable = .x) %>%
+      relocate(variable)
+    
+    return(stats_output)
+  })
+} 
+```
+
+
+```{r, results='asis'}
+#generate descriptive stats for select items
+desc_stats_tabled(.items = items_of_interest, 
+                  .df =  weather_collisions) %>%
+  kable_table("Descriptive stats, collisions and weather items of interest")
+
+```
+
+A lot of items have a first quartile of 0, so I think it would be a good idea to look at distributions visually.
+
+## Histograms
+
+```{r}
+# Function to create a histogram
+#
+# Parameters:
+# .item: string name of data column to create a histogram of
+# .df: dataset
+# .bins: optional argument for number of histogram bins, defaults to 100
+# .title: optional argument for title of histogram, defaults to 'Histogram: .item'
+#
+# Returns:
+# ggplot histogram
+
+gghist <- function(.item, .df, .bins = 100, .title = "") {
+  #if .title is empty, create a basic one
+  if (.title == "") {
+    .title = paste("Histogram:", .item, sep = " ")
+  }
+  
+  #specify item/tibble to generate histogram from
+  output <- ggplot(data = .df, 
+       aes(!!sym(.item))) + 
+    #specify number of bins, and i like green
+    geom_histogram(bins = .bins, fill = "#006400") + 
+    #ggtheme for cleaner look
+    ggtheme() +
+    #optional plot title
+    ggtitle(.title)
+  
+  print(output)
+}
+```
+
+```{r, results='asis'}
+#print each histogram iteratively
+walk(items_of_interest, 
+     gghist, 
+     .df = weather_collisions)
+```
+
+Noting that all weather items appear to have little variation and are very skewed to 0 (which makes sense since there's no rain on sunny days), but the number of num_crashes seems bimodal. Number of injury variables are a bit more normal although still a bit weighted at 0, and number killed is also very skewed toward 0.
+
+Since the variation for many of these measures seems to be fairly low, I want to check if there is even any correlation between these items.
+
+## Correlations
+
+```{r}
+# Function to calculate Pearson's correlation coefficient
+#
+# Parameters:
+# .df: dataset
+# .items: vector of string names in .df to calculate correlations among
+#
+# Returns:
+# Tibble containing Pearson's correlation coefficient, N, and P value for every combination
+# of pairs in .items input
+
+correlations_tibble <- function(.df, .items) {
+
+  # initialize a list which will contain named vectors of .items values for reference when correlating
+  item_vectors <- list()
+  
+  #for every variable in .items, extract the column as a vector and append to list with .items name
+  for (i in .items) {
+    # extract vector of i values
+    values <- .df %>%
+      pull(!!sym(i)) 
+    #append to list with variable name
+    item_vectors[[i]] <- values
+  }
+  
+  #calculating correlations for every combination of .items
+  for (i in seq(1, length(.items))) {
+    for (j in seq(i, length(.items))){
+      
+      #reference item_vectors by name for psych::corr.test correlations calculation
+      corr_output <- psych::corr.test(item_vectors[[.items[i]]], item_vectors[[.items[j]]])
+      
+      #extract and round correlation coefficient
+      corr_coef <- round(corr_output$r, 4)
+      #extract number of cases
+      n_val <- corr_output$n
+      #extract p value for correlation
+      p_val <- round(corr_output$p, 4)
+      
+      #nicely format these values, with appropriate variable names from .items
+      output <- tibble(variable = .items[j],
+                       Coefficient = corr_coef,
+                       N = n_val,
+                       `P Value` = p_val) %>%
+        pivot_longer(cols = c("Coefficient", "N", "P Value"), names_to = "Statistic", values_to = .items[i]) 
+      
+      #these next lines of code deal with outputting all combinations of coefficients in one tibble
+      #if correlating the same item, assign output to tibble initially
+      if (i == j) {
+        corr_tibble <- output
+      } else { #else append correlations to this tibble 
+        corr_tibble %<>%
+          rbind(output)
+      }
+    }
+    
+    #if first element of .items, assign correlations to final object
+    if (i == 1) {
+        final <- corr_tibble
+      } else { #otherwise join iterative element correlations to first tibble
+        final %<>%
+          left_join(corr_tibble, by = c('variable', 'Statistic'))
+      }
+  }
+  
+  #lastly, replace all NA with empty strings for easier readability
+  final %<>%
+    mutate_all(~replace(., is.na(.), ""))
+  
+  #return tibble of correlations for all combinations of .items
+  return(final)
+}
+```
+
+
+```{r, results='asis'}
+correlations_tibble(.df = weather_collisions,
+                    .items = items_of_interest) %>%
+  kable_table("Correlations table, items of interest") %>%
+  scroll_box()
+```
+
+Correlations between weather and collisions variables appear generally low. Notable negative correlations between DailySnowfall/num_crashes, and DailyPrecipitation/NUMBER_OF_CYCLIST_INJURED. 
+
+It seems that precipitation is clearly not a standout indicator for car collisions in Manhattan, if so, more variance in the car collisions would be explained by that in weather. 
+
+
+```{r, include=F}
+# Perhaps scatter plots could be useful to see if there are any distinct trend lines. 
+
+# ggscatter <- function()
+## Scatter Plots
+ggplot(data = weather_collisions, 
+       aes(DailyPrecipitation, num_crashes)) + 
+  geom_point(color = "#483D8B") +
+  ggtheme() +
+  ggtitle("Scatter Plot: Precipitation (inches) and number of num_crashes")
+```
+
+
+# Main Analysis
+
+The model I've chosen includes DailyPrecipitation (Total liquid content, water equivalent of precipitation in inches (hundreths)), DailySnowfall (Daily amount of snowfall in inches (tenths)), and DailySnowDepth (Daily reading of snow on the ground in whole inches). 
+
+DailyPrecipitation is the main variable included to assess how precipitation impacts collisions, DailySnowfall is included because I believe snowfall specifically could have a different effect on collisions than liquid rainfall, and DailySnowDepth is included on the assumption that snow on the ground, separate from precipitation, could increase collisions. 
+
+Although this model is relatively simple, I think it would be fun to try some different regression algorithms and calculate the root mean square error of each to see if any perform particularly better than OLS.
+
+## Model Exploration
+
+For model evaluation, I will split the analysis dataset into training and testing blocks to measure model performance. While a random 75% of observations will be used for training, the remaining 25% will be reserved for testing. I've selected 10 models to use on the training data and will then use these models to predict the outcomes of the testing data and calculate a RMSE.
+
+```{r}
+set.seed(1) #set random number generator seed
+
+#training data is random 75% of total
+train <- weather_collisions %>%
+  slice_sample(prop = 0.75) %>%
+  print()
+
+#test portion is 25%
+#using date since it is unique id, select remaining rows in weather_collisions
+test <- weather_collisions %>%
+  filter(!(date %in% train$date)) %>%
+  print()
+```
+
+```{r}
+#double check no overlap
+train %>%
+  inner_join(test, by = "date")
+#0 rows, lgtm
+```
+
+```{r}
+# Function to run a variety of regression algorithms and compare root mean square errors
+#
+# Parameters:
+# .model_formula: string object of regression formula, separating dependent from rhs with ~
+# .training_data: training set of analysis dataset
+# .testing_data: testing set of analysis dataset
+#
+# Returns:
+# Tibble containing model name and calculated RMSE for 10 models
+
+rmse_exploration <- function(.model_formula, .training_data, .testing_data) {
+  
+  #extract dependent from model_formula, replace any white spaces with empty string
+  .dependent <- gsub("\\s", "", str_extract(.model_formula, ".*(?=~)"))
+  
+  #extract independents from model formula as vector
+  .independents <- unlist(strsplit(gsub("\\s", "", gsub("\\+", ",", str_extract(.model_formula, "(?<=~).*"))), ","))
+  
+  #convert .model_formula from string to formula
+  .model_formula <- as.formula(.model_formula)
+  
+  #extract target_values from test data for rmse calculations
+  .target_values <- .testing_data %>%
+    pull(!!sym(.dependent))
+  
+  # set seed for models that will require randomness
+  set.seed(42)
+  
+  #Begin Analyses
+
+  #OLS 
+  
+  #ols model
+  ols_model <- lm(.model_formula, .training_data)
+  #test predictions
+  ols_predict <- predict(ols_model, newdata = .testing_data)
+  #rmse
+  ols_rmse <- sqrt(mean((.target_values - ols_predict)^2))
+  #rmse tibble OLS
+  ols_rmse_tibble <- tibble(Model = "OLS",
+                     RMSE = ols_rmse) 
+  
+  # Gaussian GLM
+  
+  #gaussian model
+  gaussian_model <- glm(.model_formula, family = "gaussian", data = .training_data)
+  #test predictions
+  gauss_predict <- predict(gaussian_model, newdata = .testing_data)
+  #rmse
+  gauss_rmse <- sqrt(mean((.target_values - gauss_predict)^2))
+  #tibble output
+  gaussian_rmse_tibble <- tibble(Model = "Gaussian",
+                          RMSE = gauss_rmse) 
+  
+  # Poisson GLM
+  
+  #poisson model
+  poisson_model <- glm(.model_formula, family = "poisson", data = .training_data)
+  #test predictions
+  poisson_predict <- predict(poisson_model, newdata = .testing_data)
+  #rmse
+  poisson_rmse <- sqrt(mean((.target_values - poisson_predict)^2))
+  #rmse for poisson
+  poisson_rmse_tibble <- tibble(Model = "Poisson",
+                         RMSE = poisson_rmse) 
+  
+  # Gamma GLM
+  
+  #gamma model
+  gamma_model <- glm(.model_formula, family = "Gamma", data = .training_data)
+  #test predictions
+  gamma_predict <- predict(gamma_model, newdata = .testing_data)
+  #rmse
+  gamma_rmse <- sqrt(mean((.target_values - gamma_predict)^2))
+  #rmse for gamma
+  gamma_rmse_tibble <- tibble(Model = "Gamma",
+                       RMSE = gamma_rmse) 
+  
+  # Tweedie GLM
+  
+  #extract maximum likelihood estimation of tweedie index parameter for model
+  #full dataset
+  tweedie_param <- tweedie.profile(.model_formula, data = weather_collisions)
+
+  #given DailyPrecipitation distribution, xi value between 1-2 makes sense
+  #mle is exactly 1.5 - nice
+
+  #run tweedie model, using mle of tweedie index param
+  tweedie_model <- glm(.model_formula, family = tweedie(var.power = tweedie_param$xi.max), data = .training_data)
+  #test predictions
+  tweedie_predict <- predict(tweedie_model, newdata = .testing_data)
+  #rmse
+  tweedie_rmse <- sqrt(mean((.target_values - tweedie_predict)^2))
+  #rmse for tweedie
+  tweedie_rmse_tibble <- tibble(Model = "Tweedie",
+                         RMSE = tweedie_rmse)
+  
+  
+  #vectors of dependent value and matrix independent values for glmnet functions
+  #train data - dependent
+  y_train <- .training_data %>%
+    pull(!!sym(.dependent))
+  #train data - independent
+  x_train <- .training_data %>%
+    select(all_of(.independents)) %>%
+    data.matrix()
+  
+  #test data - dependent
+  y_test <- .testing_data %>%
+    pull(!!sym(.dependent))
+  #test data - independent
+  x_test <- .testing_data %>%
+    select(all_of(.independents)) %>%
+    data.matrix()
+  
+  
+  # Lasso
+  
+  #k fold cross validation for lambda with lowest test mse
+  lasso_cross_val <- cv.glmnet(x_train, y_train, alpha = 1)
+  #lasso model with lambda
+  lasso_model <- glmnet(x_train, y_train, alpha = 1, lambda = lasso_cross_val$lambda.min)
+  
+  #predict test independent with test dependents, cross validated lambda
+  lasso_predict <- predict(lasso_model, newx = x_test, s = lasso_cross_val$lambda.min)
+  
+  #lasso rmse calcualtion
+  lasso_rmse <- sqrt(mean((y_test - lasso_predict)^2))
+  
+  lasso_rmse_tibble <- tibble(Model = "Lasso",
+                              RMSE = lasso_rmse)
+  
+  # Ridge
+  
+  #k fold cross validation for lambda with lowest test mse
+  ridge_cross_val <- cv.glmnet(x_train, y_train, alpha = 0)
+  #ridge model with lambda
+  ridge_model <- glmnet(x_train, y_train, alpha = 0, lambda = ridge_cross_val$lambda.min)
+  
+  #predict test independent with test dependents, cross validated lambda
+  ridge_predict <- predict(ridge_model, newx = x_test, s = ridge_cross_val$lambda.min)
+  
+  #ridge rmse calculation
+  ridge_rmse <- sqrt(mean((y_test - ridge_predict)^2))
+  
+  ridge_rmse_tibble <- tibble(Model = "Ridge",
+                              RMSE = ridge_rmse)
+  
+  # Elastic Net
+  
+  #vector of potential alpha values, from 0.05 to 0.95 (0 and 1 are used for Ridge and Lasso, respectively) at 0.05 intervals (doesn't need to be crazy specific)
+  elastic_net_alphas <- seq(0.05, 0.95, by = .05)
+  #initial list of alphas and their respective rmse for choosing best
+  alphas_rmse <- list()
+  
+  map(elastic_net_alphas, function(.alpha){
+  #k fold cross validation for lambda with lowest test mse
+  eln_cross_val <- cv.glmnet(x_train, y_train, alpha = .alpha)
+  #elastic net model with lambda, and .alpha
+  elm_model <- glmnet(x_train, y_train, alpha = .alpha, lambda = eln_cross_val$lambda.min)
+  
+  #predict test independent with test dependents, cross validated lambda, rmse calculation
+  eln_predict <- predict(elm_model, newx = x_test, s = eln_cross_val$lambda.min)
+  eln_rmse <- sqrt(mean((y_test - eln_predict)^2))
+  #append rmse and alpha as name to list
+  alphas_rmse[[as.character(.alpha)]] <<- eln_rmse
+  })
+  #index in list of lowest rmse
+  min_index <- which.min(unlist(alphas_rmse))
+  #extract best alpha and rmse from list of all results
+  best_alpha <- as.double(names(alphas_rmse)[min_index])
+  lowest_rmse <- unname(unlist(alphas_rmse))[min_index]
+  
+  eln_rmse_tibble <- tibble(Model = "Elastic Net",
+                              RMSE = lowest_rmse) 
+  
+  # Random Forest
+  
+  #random forest model
+  rf_model <- randomForest(.model_formula, data = .training_data)
+  #predict test data outcome
+  rf_predict <- predict(rf_model, newdata = .testing_data)
+  #calculate rmse
+  rf_rmse <- sqrt(mean((.target_values - rf_predict)^2))
+  #table
+  rf_rmse_tibble <- tibble(Model = "Random Forest",
+                              RMSE = rf_rmse) 
+  
+  # Neural Net
+  
+  #neural net model, first hidden layer has 3 nodes, second has 2
+  #JM: adjusting number of layers/nodes doens't seem to affect this model performance very much
+  nn_model <- neuralnet(.model_formula, data = .training_data, hidden = c(3,2))
+  #predict test outcomes
+  nn_predict <- compute(nn_model, .testing_data)
+  #calculate rmse
+  nn_rmse <- sqrt(mean((.target_values - nn_predict$net.result)^2))
+  #table rmse
+  nn_rmse_tibble <- tibble(Model = "Neural Net",
+                              RMSE = nn_rmse)
+  
+  # End of Analyses
+  
+  #list rmse table output from each model 
+  rmse_tables <- list(ols_rmse_tibble,
+                      gaussian_rmse_tibble,
+                      poisson_rmse_tibble,
+                      gamma_rmse_tibble,
+                      tweedie_rmse_tibble,
+                      lasso_rmse_tibble,
+                      ridge_rmse_tibble,
+                      eln_rmse_tibble,
+                      rf_rmse_tibble,
+                      nn_rmse_tibble)
+  
+  #bind all rmse_tables together to compare model performance
+  rmse_output <- map_dfr(rmse_tables, rbind)
+
+  return(rmse_output)
+}
+
+```
+
+```{r, warning = F, message=F, results='asis'}
+rmse_exploration(.model_formula = "num_crashes ~ DailyPrecipitation + DailySnowfall + DailySnowDepth",
+                  .training_data = train,
+                  .testing_data = test) %>%
+  kable_table('RMSE Analysis for several algorithms')
+
+```
+
+
+Lasso, Ridge, and Neural Net regressions are all able to predict the dependent value in the testing dataset just slightly better than OLS. However, I do not think the difference is large enough to warrant using any of these models. For simplicity, I will move forward using OLS for this analysis.
+
+## Linear Model
+
+```{r}
+# Function to run a linear model
+#
+# Parameters:
+# .lhs: string object of dependent variable in regression formula
+# .df: analysis dataset
+# .rhs: string object of right hand side of regression formula
+# .round: optional integer value specifying number of significant digits to round to, defaults to 5
+#
+# Returns:
+# Tibble containing lm model output including:
+#   R squared
+#   Adjusted R squared
+#   F statistic
+#   F statistic P value
+#   Number of observations in the model
+#   Estimate, Standard Error, T value, and P value for each covariate
+
+lm_function <- function(.lhs, .df, .rhs, .round = 5) {
+  
+  #convert .lhs and .rhs into lm formula
+  model_formula <- as.formula(paste(.lhs, "~", .rhs, sep = " "))
+  #run model
+  model <- lm(model_formula, .df) 
+  #get model summary
+  model_summary <- summary(model) 
+  
+  #extract adjusted r squared and mult r squared from model summary
+  # round to 5 decimal places
+  adj_r <- model_summary$adj.r.squared
+  mult_r <- model_summary$r.squared
+  
+  #use anova to extract f stat and it's p value from model
+  f_stat <- anova(model)$F[1]
+  f_stat_p <- anova(model)$Pr[1]
+  
+  #number of observations used
+  n_obs <- nobs(model)
+  
+  #extract estimate, std error, t and p values from model summary and table nicely
+  coefficients <- as.data.frame(model_summary$coefficients) %>%
+    rownames_to_column() %>%
+    as_tibble() %>%
+    #filtering out intercept row of coefficients
+    filter(rowname != "(Intercept)") %>%
+    #rename several items
+    rename("Variable" = rowname,
+           "Std_Error" = `Std. Error`,
+           "t_value" = `t value`,
+           "p_value" = `Pr(>|t|)`) %>%
+    #round every numeric column to .round value 
+    mutate(across(where(is.numeric), ~ round(., .round))) %>%
+    #create item displaying formula, paste p val stars to p value
+    mutate(Dependent = .lhs,
+           Formula = .rhs,
+           p_value = paste(p_value, stars.pval(p_value))) %>%
+    relocate(Formula) %>%
+    # pivot wider by Variables, 1 row per lm run, more useful when there's multiple regressors
+    # vary names slowest to group output by each lhs item
+    pivot_wider(id_cols = c('Dependent', 'Formula'), names_from = "Variable", values_from = c("Estimate", "Std_Error", "t_value", "p_value"), names_vary = "slowest") 
+  
+  #manually build lm output tibble including formula, r squared, f stat
+  lm_output <- tibble(Dependent = .lhs,
+                      Formula = .rhs,
+                      r_squared = mult_r,
+                      adj_r_squared = adj_r,
+                      F_statistic = f_stat,
+                      F_p_value = f_stat_p,
+                      n_obs = n_obs) %>%
+    #round all numeric output
+    mutate(across(where(is.numeric), ~ round(., .round))) %>%
+    #append stars to F stat p value
+    mutate(F_p_value = paste(F_p_value, stars.pval(F_p_value))) %>%
+    #join coefficients by formula
+    left_join(coefficients, by = c("Dependent", "Formula"))
+  
+  return(lm_output)
+}
+```
+
+```{r}
+#vector of dependent variable names to run on model
+dependents <- weather_collisions %>%
+  select(num_crashes, matches("NUMBER")) %>%
+  names() 
+```
+
+```{r, results='asis'}
+#run them on lm function with .rhs being only DailyPrecipitation
+map_dfr(dependents, 
+        lm_function, 
+        .df = weather_collisions, 
+        .rhs = "DailyPrecipitation + DailySnowfall + DailySnowDepth") %>%
+  kable_table("Results of linear models, collision variables on daily precipitation") %>%
+  scroll_box()
+```
+
+The table above presents the linear model results regressing number of vehicle collisions and number of injuries and fatalities on daily precipitation, snowfall, and snow depth. 
+
+Regarding number of car collisions, the estimates on DailyPrecipitation and DailySnowfall are only significant at the 10% level, and DailylSnowDepth is not significant. Notably, the precipitation and snowfall estimates are positive and negative, respectively. Precipitation appears to be associated with an increase in the number of crashes in Manhattan between 2013 - 2022 as I hypothesized, but I did not expect snowfall itself to be correlated with a decrease. Perhaps there are fewer drivers on the road during snowy days, which would likely cause the gross number of crashes to be lower. 
+
+On average, each additional inch of daily precipitation is associated with one and a half persons injured from car collisions. Both snowfall and snow depth have significant negative estimates with persons injured which was unexpected, but which perhaps I can contribute to the same theory that on snowy days there are fewer drivers out. 
+
+An additional inch of precipitation is associated on average with a reduction in the number of cyclists injured by about 0.4 but an increase in the number of cyclists killed by 0.01 in car collisions. Perhaps on average there are fewer cyclists on the road during rainy days to get injured, but rainfall appears to increase the risk of fatality.
+
+# Discussion
+
+The findings above are not without limitations. 
+
+There are many other potentially influential predictors of car collisions besides weather, and this is evidenced by the low correlations, relatively high RMSE, and low adjusted R squared values presented in this programming sample. A potential next step would be to control for this variation in car collisions not due to weather, but  this task could prove difficult since there are likely many factors that contribute to collisions.
+
+However, an easier next step I could take is to do an hourly analysis between weather and collisions instead of a daily one. This would help to reduce model errors by more directly comparing collisions and weather by the time each occur. Regarding collisions, I think it makes sense to average the injuries and fatalities dependents instead of summing. This could partially control for the number of drivers on the road at any given time if my assumption that the number of drivers on the road impacts the number of crashes holds. 
+
+The weather data itself and the assumptions I made about it could be improved as well. I am only using weather data collected from the Central Park NOAA weather station and assuming that those observations hold for the entire island of Manhattan. Just because it rains in Midtown does not mean it is raining downtown. I could improve this by gathering weather information from a different source and analyzing it geospatially. 
+
+
+
+
+
+
+
