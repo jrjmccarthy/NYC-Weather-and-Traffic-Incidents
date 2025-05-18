@@ -4,6 +4,10 @@ Welcome to my NYC weather and traffic incidents repository! In this project, I t
 
 ## Files
 
+* NOAA_LCD_Central_Park_2013_2021.zip: Raw hourly weather observations from the NOAA Central Park station. Obtained through [Climate Data Online](https://www.ncei.noaa.gov/cdo-web/)
+
+## Raw Data
+
 
 
 
